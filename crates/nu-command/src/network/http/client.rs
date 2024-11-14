@@ -10,12 +10,17 @@ use nu_protocol::{ByteStream, LabeledError, Signals};
 use serde_json::Value as JsonValue;
 use std::{
     collections::HashMap,
-    io::Cursor,
+    io::{Cursor, Read},
     path::PathBuf,
     str::FromStr,
-    sync::mpsc::{self, RecvTimeoutError},
-    time::Duration,
+    sync::{
+        mpsc::{self, Receiver, RecvTimeoutError, TryRecvError},
+        Arc, Mutex,
+    },
+    thread,
+    time::{Duration, Instant},
 };
+use tungstenite::ClientRequestBuilder;
 use ureq::{Error, ErrorKind, Request, Response};
 use url::Url;
 
@@ -40,6 +45,128 @@ impl From<Option<ContentType>> for BodyType {
             Some(it) => BodyType::Unknown(Some(it)),
             None => BodyType::Unknown(None),
         }
+    }
+}
+
+pub struct ChannelReader {
+    rx: Arc<Mutex<Receiver<u8>>>,
+    deadline: Option<Instant>,
+}
+
+impl ChannelReader {
+    pub fn new(rx: Receiver<u8>, timeout: Option<Duration>) -> Self {
+        let mut cr = Self {
+            rx: Arc::new(Mutex::new(rx)),
+            deadline: None,
+        };
+        if let Some(timeout) = timeout {
+            cr.deadline = Some(Instant::now() + timeout);
+        }
+        cr
+    }
+}
+
+impl Read for ChannelReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let rx = self.rx.clone();
+        let rx = rx.lock().expect("Could not get lock on receiver");
+
+        let mut len = 0;
+        for buf in buf {
+            let byte = if len != 0 {
+                rx.try_recv()
+            } else {
+                match self.deadline {
+                    Some(deadline) => rx
+                        .recv_timeout(deadline.duration_since(Instant::now()))
+                        .map_err(|_| TryRecvError::Disconnected),
+                    None => rx.recv().map_err(|_| TryRecvError::Disconnected),
+                }
+            };
+            match byte {
+                Ok(b) => {
+                    *buf = b;
+                    len += 1;
+                }
+                Err(..) => return Ok(len),
+            }
+        }
+        Ok(len)
+    }
+}
+
+pub trait Upgradable {
+    fn upgrade(&self, timeout: Option<Duration>, req: &Request) -> Option<ChannelReader>;
+}
+
+impl Upgradable for Response {
+    fn upgrade(&self, timeout: Option<Duration>, req: &Request) -> Option<ChannelReader> {
+        if Some("chunked") == self.header("transfer-encoding") {
+            if let Ok(url) = Url::parse(self.get_url()) {
+                let mut new_url = url.clone();
+                let _ = match new_url.scheme() {
+                    "https" => new_url.set_scheme("wss"),
+                    _ => new_url.set_scheme("ws"),
+                };
+                let mut builder = ClientRequestBuilder::new(new_url.as_str().parse().ok()?);
+                builder = builder.with_header(
+                    "Origin",
+                    format!(
+                        "{}://{}:{}",
+                        url.scheme(),
+                        url.host_str().unwrap_or_default(),
+                        url.port().unwrap_or_default()
+                    ),
+                );
+                for name in req.header_names() {
+                    builder = builder.with_header(
+                        &name,
+                        req.header(name.as_str()).expect("Could not get header"),
+                    );
+                }
+                match tungstenite::connect(builder) {
+                    Ok((mut websocket, _)) => {
+                        let (tx, rx) = mpsc::sync_channel(1024);
+                        let tx = Arc::new(tx);
+                        thread::spawn(move || loop {
+                            let tx = tx.clone();
+                            match websocket.read() {
+                                Ok(msg) => match msg {
+                                    tungstenite::Message::Text(msg) => msg
+                                        .bytes()
+                                        .for_each(|b| if tx.send(b).is_err() {
+                                            websocket.close(Some(tungstenite::protocol::CloseFrame{
+                                                code: tungstenite::protocol::frame::coding::CloseCode::Normal,
+                                                reason: std::borrow::Cow::Borrowed("byte stream closed"),
+                                            })).expect("Could not close connection")
+                                        }),
+                                    tungstenite::Message::Binary(msg) => msg
+                                        .iter()
+                                        .for_each(|&b| if tx.send(b).is_err() {
+                                            websocket.close(Some(tungstenite::protocol::CloseFrame{
+                                                code: tungstenite::protocol::frame::coding::CloseCode::Normal,
+                                                reason: std::borrow::Cow::Borrowed("byte stream closed"),
+                                            })).expect("Could not close connection")
+                                        }),
+                                    tungstenite::Message::Close(..) => {
+                                        drop(tx);
+                                        return;
+                                    }
+                                    _ => continue,
+                                },
+                                _ => {
+                                    drop(tx);
+                                    return;
+                                }
+                            }
+                        });
+                        return Some(ChannelReader::new(rx, timeout));
+                    }
+                    Err(..) => return None,
+                }
+            }
+        }
+        None
     }
 }
 

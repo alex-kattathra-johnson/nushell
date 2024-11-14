@@ -1,7 +1,9 @@
+use std::time::Duration;
+
 use crate::network::http::client::{
     check_response_redirection, http_client, http_parse_redirect_mode, http_parse_url,
     request_add_authorization_header, request_add_custom_headers, request_handle_response,
-    request_set_timeout, send_request, RequestFlags,
+    request_set_timeout, send_request, RequestFlags, Upgradable,
 };
 use nu_engine::command_prelude::*;
 
@@ -52,6 +54,11 @@ impl Command for SubCommand {
                 "raw",
                 "fetch contents as text rather than a table",
                 Some('r'),
+            )
+            .switch(
+                "stream",
+                "attempt to upgrade the connection to websocket and stream the output",
+                Some('s'),
             )
             .switch(
                 "insecure",
@@ -132,6 +139,7 @@ struct Arguments {
     url: Value,
     headers: Option<Value>,
     raw: bool,
+    stream: bool,
     insecure: bool,
     user: Option<String>,
     password: Option<String>,
@@ -151,6 +159,7 @@ fn run_get(
         url: call.req(engine_state, stack, 0)?,
         headers: call.get_flag(engine_state, stack, "headers")?,
         raw: call.has_flag(engine_state, stack, "raw")?,
+        stream: call.has_flag(engine_state, stack, "stream")?,
         insecure: call.has_flag(engine_state, stack, "insecure")?,
         user: call.get_flag(engine_state, stack, "user")?,
         password: call.get_flag(engine_state, stack, "password")?,
@@ -177,7 +186,7 @@ fn helper(
     let client = http_client(args.insecure, redirect_mode, engine_state, stack)?;
     let mut request = client.get(&requested_url);
 
-    request = request_set_timeout(args.timeout, request)?;
+    request = request_set_timeout(args.timeout.clone(), request)?;
     request = request_add_authorization_header(args.user, args.password, request);
     request = request_add_custom_headers(args.headers, request)?;
 
@@ -196,6 +205,29 @@ fn helper(
     };
 
     check_response_redirection(redirect_mode, span, &response)?;
+    if args.stream {
+        if let Ok(ref response) = response {
+            let timeout = args.timeout.map(|ref val| {
+                Duration::from_nanos(
+                    val.as_duration()
+                        .expect("Timeout should be set to duration") as u64,
+                )
+            });
+            if let Some(upgrade) = response.upgrade(timeout, &request) {
+                let reader = Box::new(upgrade);
+                return Ok(PipelineData::ByteStream(
+                    ByteStream::read(
+                        reader,
+                        span,
+                        engine_state.signals().clone(),
+                        ByteStreamType::Unknown,
+                    ),
+                    None,
+                ));
+            }
+        }
+    }
+
     request_handle_response(
         engine_state,
         stack,
